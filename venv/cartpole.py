@@ -85,7 +85,7 @@ class ReplayMemory:
         return len(self.memory)
 
 # Create env with live rendering
-env = gym.make('CartPole-v1')
+env = gym.make('CartPole-v1', render_mode='human')
 state_size = env.observation_space.shape[0]  # 4
 action_size = env.action_space.n  # 2
 
