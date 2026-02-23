@@ -1,10 +1,6 @@
-venv/bin/
-venv/lib/
-venv/include/
-venv/share/
-venv/pyvenv.cfg
-venv/__pycache__/
-venv/cartpole_checkpoint.pt
+.venv/
 __pycache__/
 *.pyc
+*.pt
+*.pkl
 .DS_Store

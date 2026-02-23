@@ -1,0 +1,600 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import gymnasium as gym
+import ale_py
+import numpy as np
+import pickle
+import os
+import sys
+from datetime import datetime
+
+# Register ALE environments with gymnasium
+gym.register_envs(ale_py)
+
+# Checkpoint path
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), 'mspacman_neuroevo_checkpoint.pkl')
+
+
+def pick_menu(options):
+    """Arrow-key menu selector."""
+    import tty, termios
+    selected = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            # Clear and draw menu
+            sys.stdout.write(f"\r\033[J")
+            for i, opt in enumerate(options):
+                prefix = "> " if i == selected else "  "
+                sys.stdout.write(f"{prefix}{opt}\n")
+            sys.stdout.write(f"\033[{len(options)}A")  # move cursor back up
+            sys.stdout.flush()
+            # Read keypress
+            ch = sys.stdin.read(1)
+            if ch == '\r':
+                break
+            if ch == '\x1b':
+                sys.stdin.read(1)  # skip [
+                arrow = sys.stdin.read(1)
+                if arrow == 'A':
+                    selected = (selected - 1) % len(options)
+                elif arrow == 'B':
+                    selected = (selected + 1) % len(options)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(f"\r\033[J")  # clean up
+        sys.stdout.flush()
+    return selected
+
+
+# ============================================================================
+# GENOME REPRESENTATION
+# ============================================================================
+
+class Genome:
+    """Represents a single neural network as a genome."""
+    def __init__(self, weights, fitness=0.0, generation_born=0):
+        self.weights = weights  # Flattened numpy array of all network parameters
+        self.fitness = fitness
+        self.generation_born = generation_born
+
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+
+class PolicyNetwork(nn.Module):
+    """Large network for Ms. Pac-Man: 128 → 128 → 128 → 9."""
+    def __init__(self, state_size=128, action_size=9, hidden_size=128):
+        super().__init__()
+        self.fc1 = nn.Linear(state_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, action_size)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+    def select_action(self, state):
+        """Deterministic policy: argmax over action values."""
+        with torch.no_grad():
+            q_values = self.forward(state)
+            return q_values.argmax().item()
+
+
+class SmallPolicyNetwork(nn.Module):
+    """Smaller network for fast iteration: 128 → 64 → 9."""
+    def __init__(self, state_size=128, action_size=9):
+        super().__init__()
+        self.fc1 = nn.Linear(state_size, 64)
+        self.fc2 = nn.Linear(64, action_size)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+    def select_action(self, state):
+        """Deterministic policy: argmax over action values."""
+        with torch.no_grad():
+            q_values = self.forward(state)
+            return q_values.argmax().item()
+
+
+# ============================================================================
+# GENOME <-> NETWORK CONVERSION
+# ============================================================================
+
+def extract_genome(model):
+    """Extract all network weights as a flat numpy array."""
+    weights = []
+    for param in model.parameters():
+        weights.append(param.data.cpu().numpy().flatten())
+    return np.concatenate(weights)
+
+
+def inject_genome(model, genome):
+    """Load genome weights back into network."""
+    offset = 0
+    for param in model.parameters():
+        num_weights = param.numel()
+        param_weights = genome[offset:offset + num_weights]
+        param.data = torch.FloatTensor(param_weights.reshape(param.shape))
+        offset += num_weights
+
+
+# ============================================================================
+# GENOME EVALUATION
+# ============================================================================
+
+def evaluate_genome(genome, env, model, device, k_episodes=1, max_steps=5000, frame_skip=4, idle_penalty=0.1):
+    """
+    Evaluate a genome by running k episodes and averaging rewards.
+
+    Fitness = game score - (idle_penalty * frames_with_no_reward).
+    The idle penalty discourages parking in a corner and waiting to die.
+
+    Args:
+        genome: Genome object to evaluate
+        env: Gymnasium environment
+        model: PyTorch model to inject weights into
+        device: torch device
+        k_episodes: Number of episodes to average over
+        max_steps: Maximum frames per episode (prevents infinite loops)
+        frame_skip: Repeat each action for this many frames (speeds up evaluation)
+        idle_penalty: Points subtracted per decision step with zero reward
+
+    Returns:
+        Average fitness (total reward) across k episodes
+    """
+    inject_genome(model, genome.weights)
+    model.eval()
+
+    total_rewards = []
+
+    for _ in range(k_episodes):
+        observation, _ = env.reset()
+        episode_reward = 0
+        steps = 0
+
+        while steps < max_steps:
+            # Convert RAM bytes to float tensor (normalize 0-255 to 0-1)
+            state = torch.FloatTensor(observation.astype(np.float32) / 255.0).unsqueeze(0).to(device)
+            action = model.select_action(state)
+
+            # Frame skipping: repeat action for frame_skip frames
+            frame_reward = 0
+            for _ in range(frame_skip):
+                observation, reward, terminated, truncated, _ = env.step(action)
+                frame_reward += reward
+                steps += 1
+                if terminated or truncated or steps >= max_steps:
+                    break
+
+            episode_reward += frame_reward
+
+            # Penalize idle steps (no score gained)
+            if frame_reward == 0:
+                episode_reward -= idle_penalty
+
+            if terminated or truncated:
+                break
+
+        total_rewards.append(episode_reward)
+
+    return np.mean(total_rewards)
+
+
+# ============================================================================
+# EVOLUTIONARY OPERATORS
+# ============================================================================
+
+def select_parents(population, elite_count, truncation_ratio):
+    """
+    Select top performers for breeding.
+
+    Returns:
+        elites, breeding_pool (both lists of Genome objects)
+    """
+    sorted_pop = sorted(population, key=lambda g: g.fitness, reverse=True)
+    elites = sorted_pop[:elite_count]
+    breeding_pool_size = max(elite_count, int(len(population) * truncation_ratio))
+    breeding_pool = sorted_pop[:breeding_pool_size]
+    return elites, breeding_pool
+
+
+def mutate_genome(parent, mutation_std, generation):
+    """Create offspring by adding Gaussian noise to parent weights."""
+    noise = np.random.normal(0, mutation_std, size=parent.weights.shape)
+    child_weights = parent.weights + noise
+    return Genome(child_weights, fitness=0.0, generation_born=generation)
+
+
+def generate_offspring(breeding_pool, target_size, elite_count, mutation_std, generation):
+    """Generate next generation from breeding pool."""
+    offspring = []
+    num_offspring_needed = target_size - elite_count
+
+    for _ in range(num_offspring_needed):
+        parent = np.random.choice(breeding_pool)
+        child = mutate_genome(parent, mutation_std, generation)
+        offspring.append(child)
+
+    return offspring
+
+
+# ============================================================================
+# CHECKPOINT SYSTEM
+# ============================================================================
+
+def save_checkpoint(population, generation, history, config, path):
+    """Save evolution state to disk."""
+    checkpoint = {
+        'population': population,
+        'generation': generation,
+        'history': history,
+        'config': config,
+        'timestamp': datetime.now().isoformat()
+    }
+    with open(path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+
+
+def load_checkpoint(path):
+    """Load evolution state from disk."""
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def export_best_to_pytorch(genome, config, save_path):
+    """Export best genome as loadable PyTorch checkpoint."""
+    state_size = 128
+    action_size = 9
+
+    if config['network_type'] == 'small':
+        model = SmallPolicyNetwork(state_size, action_size)
+    else:
+        model = PolicyNetwork(state_size, action_size, hidden_size=128)
+
+    inject_genome(model, genome.weights)
+
+    torch.save({
+        'state_dict': model.state_dict(),
+        'fitness': genome.fitness,
+        'generation': genome.generation_born,
+        'config': config,
+    }, save_path)
+
+    print(f"Best genome exported to: {save_path}")
+
+
+# ============================================================================
+# MAIN EVOLUTION LOOP
+# ============================================================================
+
+def evolve(config, resume_from=None):
+    """
+    Main neuroevolution loop for Ms. Pac-Man.
+
+    Args:
+        config: Dictionary with hyperparameters
+        resume_from: Path to checkpoint file (if resuming)
+
+    Returns:
+        Best Genome object, history dict
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = gym.make('ALE/MsPacman-v5', obs_type='ram')
+
+    state_size = 128
+    action_size = 9
+
+    if config['network_type'] == 'small':
+        model = SmallPolicyNetwork(state_size, action_size).to(device)
+    else:
+        model = PolicyNetwork(state_size, action_size, hidden_size=128).to(device)
+
+    # Initialize or resume
+    if resume_from and os.path.exists(resume_from):
+        checkpoint = load_checkpoint(resume_from)
+        population = checkpoint['population']
+        start_gen = checkpoint['generation'] + 1
+        history = checkpoint['history']
+        print(f"Resumed from generation {checkpoint['generation']}")
+    else:
+        print(f"Initializing random population of {config['population_size']}...")
+        genome_size = sum(p.numel() for p in model.parameters())
+        print(f"Genome size: {genome_size} parameters")
+
+        population = []
+        for i in range(config['population_size']):
+            random_weights = extract_genome(model)  # Get shape template
+            random_weights = np.random.randn(len(random_weights)) * 0.1
+            population.append(Genome(random_weights, fitness=0.0, generation_born=0))
+
+        start_gen = 0
+        history = {
+            'best_fitness': [],
+            'mean_fitness': [],
+            'worst_fitness': [],
+        }
+
+    # Evolution loop
+    for generation in range(start_gen, config['max_generations']):
+        print(f"\n{'='*60}")
+        print(f"Generation {generation}")
+        print(f"{'='*60}")
+
+        # Evaluate population
+        fitnesses = []
+        for i, genome in enumerate(population):
+            fitness = evaluate_genome(
+                genome, env, model, device,
+                k_episodes=config['fitness_episodes'],
+                max_steps=config['max_steps'],
+                frame_skip=config['frame_skip']
+            )
+            genome.fitness = fitness
+            fitnesses.append(fitness)
+
+            if (i + 1) % 5 == 0 or (i + 1) == len(population):
+                print(f"  Evaluated: {i+1}/{len(population)} genomes", end='\r')
+
+        print()  # Newline after progress
+
+        # Track statistics
+        best_fitness = max(fitnesses)
+        mean_fitness = np.mean(fitnesses)
+        worst_fitness = min(fitnesses)
+
+        history['best_fitness'].append(best_fitness)
+        history['mean_fitness'].append(mean_fitness)
+        history['worst_fitness'].append(worst_fitness)
+
+        # Print stats
+        print(f"  Best:  {best_fitness:7.1f}  |  Mean:  {mean_fitness:7.1f}  |  Worst:  {worst_fitness:7.1f}")
+
+        # Selection
+        elites, breeding_pool = select_parents(
+            population,
+            config['elite_count'],
+            config['truncation_ratio']
+        )
+
+        print(f"  Elites: {config['elite_count']}  |  Breeding pool: {len(breeding_pool)}")
+
+        # Generate offspring
+        offspring = generate_offspring(
+            breeding_pool,
+            config['population_size'],
+            config['elite_count'],
+            config['mutation_std'],
+            generation + 1
+        )
+
+        # Create next generation (elites + offspring)
+        population = elites + offspring
+
+        # Save checkpoint every N generations
+        if generation % config['checkpoint_interval'] == 0:
+            save_checkpoint(population, generation, history, config, CHECKPOINT_PATH)
+            print(f"  Checkpoint saved at generation {generation}")
+
+    # Final checkpoint
+    save_checkpoint(population, generation, history, config, CHECKPOINT_PATH)
+
+    # Best genome = top elite from the final generation (consistent performer, not a one-time outlier)
+    best_genome = max(population, key=lambda g: g.fitness)
+
+    env.close()
+    return best_genome, history
+
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+def test_best_genome(genome, config, num_episodes=5):
+    """Test best genome without rendering."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = gym.make('ALE/MsPacman-v5', obs_type='ram')
+
+    state_size = 128
+    action_size = 9
+
+    if config['network_type'] == 'small':
+        model = SmallPolicyNetwork(state_size, action_size).to(device)
+    else:
+        model = PolicyNetwork(state_size, action_size, hidden_size=128).to(device)
+
+    inject_genome(model, genome.weights)
+    model.eval()
+
+    print(f"\n{'='*60}")
+    print(f"Testing best genome (Fitness: {genome.fitness:.1f}, Gen: {genome.generation_born})")
+    print(f"{'='*60}")
+
+    rewards = []
+    for episode in range(num_episodes):
+        observation, _ = env.reset()
+        total_reward = 0
+        steps = 0
+
+        while steps < config.get('max_steps', 10000):
+            state = torch.FloatTensor(observation.astype(np.float32) / 255.0).unsqueeze(0).to(device)
+            action = model.select_action(state)
+
+            for _ in range(config.get('frame_skip', 4)):
+                observation, reward, terminated, truncated, _ = env.step(action)
+                total_reward += reward
+                steps += 1
+                if terminated or truncated or steps >= config.get('max_steps', 10000):
+                    break
+
+            if terminated or truncated:
+                break
+
+        rewards.append(total_reward)
+        print(f"  Episode {episode+1}: {total_reward:.0f}")
+
+    print(f"\nAverage: {np.mean(rewards):.1f} +/- {np.std(rewards):.1f}")
+
+    env.close()
+    return rewards
+
+
+def test_random_baseline(num_episodes=5, max_steps=5000, frame_skip=4):
+    """Test random agent for comparison."""
+    env = gym.make('ALE/MsPacman-v5', obs_type='ram')
+
+    print(f"\n{'='*60}")
+    print(f"Random baseline agent")
+    print(f"{'='*60}")
+
+    rewards = []
+    for episode in range(num_episodes):
+        env.reset()
+        total_reward = 0
+        steps = 0
+
+        while steps < max_steps:
+            action = env.action_space.sample()
+
+            for _ in range(frame_skip):
+                _, reward, terminated, truncated, _ = env.step(action)
+                total_reward += reward
+                steps += 1
+                if terminated or truncated or steps >= max_steps:
+                    break
+
+            if terminated or truncated:
+                break
+
+        rewards.append(total_reward)
+        print(f"  Episode {episode+1}: {total_reward:.0f}")
+
+    print(f"\nAverage: {np.mean(rewards):.1f} +/- {np.std(rewards):.1f}")
+
+    env.close()
+    return rewards
+
+
+# ============================================================================
+# CONFIGURATION PROFILES
+# ============================================================================
+
+FAST_CONFIG = {
+    'game': 'mspacman',
+    'name': 'Fast iteration profile',
+    'population_size': 30,
+    'network_type': 'small',       # 128 -> 64 -> 9
+    'fitness_episodes': 1,
+    'mutation_std': 0.1,
+    'elite_count': 2,
+    'truncation_ratio': 0.2,
+    'max_generations': 100,
+    'checkpoint_interval': 5,
+    'max_steps': 5000,
+    'frame_skip': 4,
+}
+
+STABLE_CONFIG = {
+    'game': 'mspacman',
+    'name': 'Stable learning profile',
+    'population_size': 100,
+    'network_type': 'large',       # 128 -> 128 -> 128 -> 9
+    'fitness_episodes': 3,
+    'mutation_std': 0.05,
+    'elite_count': 5,
+    'truncation_ratio': 0.15,
+    'max_generations': 300,
+    'checkpoint_interval': 10,
+    'max_steps': 10000,
+    'frame_skip': 4,
+}
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    print("Ms. Pac-Man Neuroevolution\n")
+
+    # Menu
+    options = [
+        f"New run - {FAST_CONFIG['name']} (~30 min / 100 gen)",
+        f"New run - {STABLE_CONFIG['name']} (~2-3 hrs / 300 gen)",
+    ]
+
+    if os.path.exists(CHECKPOINT_PATH):
+        options.append("Resume training (from checkpoint)")
+
+    choice = pick_menu(options)
+
+    # Determine config and resume status
+    if choice == 0:
+        config = FAST_CONFIG
+        resume = False
+    elif choice == 1:
+        config = STABLE_CONFIG
+        resume = False
+    else:
+        checkpoint = load_checkpoint(CHECKPOINT_PATH)
+        config = checkpoint['config']
+        resume = True
+
+    # Print configuration
+    print(f"\nConfiguration: {config['name']}")
+    print(f"  Population: {config['population_size']}")
+    print(f"  Network: {config['network_type']}")
+    print(f"  Fitness episodes: {config['fitness_episodes']}")
+    print(f"  Mutation std: {config['mutation_std']}")
+    print(f"  Elite count: {config['elite_count']}")
+    print(f"  Max steps/episode: {config['max_steps']}")
+    print(f"  Frame skip: {config['frame_skip']}")
+    print()
+
+    # Run evolution
+    best_genome, history = evolve(config, resume_from=CHECKPOINT_PATH if resume else None)
+
+    # Print evolution summary
+    print(f"\n{'='*60}")
+    print(f"Evolution Summary")
+    print(f"{'='*60}")
+    print(f"Best fitness: {best_genome.fitness:.1f}")
+    print(f"Best generation: {best_genome.generation_born}")
+    print(f"Total generations: {len(history['best_fitness'])}")
+    print(f"Final mean fitness: {history['mean_fitness'][-1]:.1f}")
+
+    # Test best genome
+    test_best_genome(best_genome, config, num_episodes=5)
+
+    # Random baseline comparison
+    test_random_baseline(
+        num_episodes=5,
+        max_steps=config['max_steps'],
+        frame_skip=config['frame_skip']
+    )
+
+    # Ask if user wants to save
+    print()
+    save_choice = pick_menu(["Save best genome", "Don't save"])
+
+    if save_choice == 0:
+        print("\nEnter filename (without .pt extension): ", end='', flush=True)
+        filename = input().strip()
+        if filename:
+            save_path = os.path.join(os.path.dirname(__file__), f'{filename}.pt')
+            export_best_to_pytorch(best_genome, config, save_path)
+        else:
+            print("No filename entered, skipping save.")
+
+    print("\nDone!")
+
+
+if __name__ == '__main__':
+    main()
