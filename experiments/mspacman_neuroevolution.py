@@ -29,7 +29,7 @@ def pick_menu(options):
             sys.stdout.write(f"\r\033[J")
             for i, opt in enumerate(options):
                 prefix = "> " if i == selected else "  "
-                sys.stdout.write(f"{prefix}{opt}\n")
+                sys.stdout.write(f"{prefix}{opt}\r\n")
             sys.stdout.write(f"\033[{len(options)}A")  # move cursor back up
             sys.stdout.flush()
             # Read keypress
@@ -130,12 +130,12 @@ def inject_genome(model, genome):
 # GENOME EVALUATION
 # ============================================================================
 
-def evaluate_genome(genome, env, model, device, k_episodes=1, max_steps=5000, frame_skip=4, idle_penalty=0.1):
+def evaluate_genome(genome, env, model, device, k_episodes=1, max_steps=5000, frame_skip=4):
     """
-    Evaluate a genome by running k episodes and averaging rewards.
+    Evaluate a genome by running k episodes and averaging raw game score.
 
-    Fitness = game score - (idle_penalty * frames_with_no_reward).
-    The idle penalty discourages parking in a corner and waiting to die.
+    No fitness shaping — just the game score. Degenerate strategies are
+    handled by population diversity, not artificial penalties.
 
     Args:
         genome: Genome object to evaluate
@@ -145,7 +145,6 @@ def evaluate_genome(genome, env, model, device, k_episodes=1, max_steps=5000, fr
         k_episodes: Number of episodes to average over
         max_steps: Maximum frames per episode (prevents infinite loops)
         frame_skip: Repeat each action for this many frames (speeds up evaluation)
-        idle_penalty: Points subtracted per decision step with zero reward
 
     Returns:
         Average fitness (total reward) across k episodes
@@ -175,10 +174,6 @@ def evaluate_genome(genome, env, model, device, k_episodes=1, max_steps=5000, fr
                     break
 
             episode_reward += frame_reward
-
-            # Penalize idle steps (no score gained)
-            if frame_reward == 0:
-                episode_reward -= idle_penalty
 
             if terminated or truncated:
                 break
@@ -213,14 +208,24 @@ def mutate_genome(parent, mutation_std, generation):
     return Genome(child_weights, fitness=0.0, generation_born=generation)
 
 
-def generate_offspring(breeding_pool, target_size, elite_count, mutation_std, generation):
-    """Generate next generation from breeding pool."""
+def generate_offspring(breeding_pool, target_size, elite_count, mutation_std, generation, explorer_count=0, explorer_std_mult=3.0):
+    """Generate next generation from breeding pool, plus explorers for diversity.
+
+    Explorers are mutated from the current best genome with high noise —
+    they inherit enough structure to not be useless but explore further out.
+    """
     offspring = []
-    num_offspring_needed = target_size - elite_count
+    num_offspring_needed = target_size - elite_count - explorer_count
 
     for _ in range(num_offspring_needed):
         parent = np.random.choice(breeding_pool)
         child = mutate_genome(parent, mutation_std, generation)
+        offspring.append(child)
+
+    # Explorers: heavy mutations of the best genome
+    best = max(breeding_pool, key=lambda g: g.fitness)
+    for _ in range(explorer_count):
+        child = mutate_genome(best, mutation_std * explorer_std_mult, generation)
         offspring.append(child)
 
     return offspring
@@ -322,7 +327,11 @@ def evolve(config, resume_from=None):
             'worst_fitness': [],
         }
 
-    # Evolution loop
+    # Evolution loop — if resuming past max_generations, run 50 more
+    if start_gen >= config['max_generations']:
+        config['max_generations'] = start_gen + 50
+        print(f"Extending evolution to generation {config['max_generations']}")
+
     for generation in range(start_gen, config['max_generations']):
         print(f"\n{'='*60}")
         print(f"Generation {generation}")
@@ -366,16 +375,18 @@ def evolve(config, resume_from=None):
 
         print(f"  Elites: {config['elite_count']}  |  Breeding pool: {len(breeding_pool)}")
 
-        # Generate offspring
+        # Generate offspring (with explorers for diversity)
         offspring = generate_offspring(
             breeding_pool,
             config['population_size'],
             config['elite_count'],
             config['mutation_std'],
-            generation + 1
+            generation + 1,
+            explorer_count=config.get('explorer_count', 0),
+            explorer_std_mult=config.get('explorer_std_mult', 3.0)
         )
 
-        # Create next generation (elites + offspring)
+        # Create next generation (elites + offspring + explorers)
         population = elites + offspring
 
         # Save checkpoint every N generations
@@ -486,15 +497,34 @@ def test_random_baseline(num_episodes=5, max_steps=5000, frame_skip=4):
 # CONFIGURATION PROFILES
 # ============================================================================
 
-FAST_CONFIG = {
+QUICK_CONFIG = {
     'game': 'mspacman',
-    'name': 'Fast iteration profile',
+    'name': 'Quick test profile',
     'population_size': 30,
     'network_type': 'small',       # 128 -> 64 -> 9
     'fitness_episodes': 1,
     'mutation_std': 0.1,
     'elite_count': 2,
     'truncation_ratio': 0.2,
+    'explorer_count': 2,
+    'explorer_std_mult': 3.0,
+    'max_generations': 50,
+    'checkpoint_interval': 5,
+    'max_steps': 3000,
+    'frame_skip': 4,
+}
+
+FAST_CONFIG = {
+    'game': 'mspacman',
+    'name': 'Fast iteration profile',
+    'population_size': 100,
+    'network_type': 'small',       # 128 -> 64 -> 9
+    'fitness_episodes': 1,
+    'mutation_std': 0.1,
+    'elite_count': 3,
+    'truncation_ratio': 0.2,
+    'explorer_count': 5,            # heavy-mutated scouts per generation
+    'explorer_std_mult': 3.0,       # explorers get 3x normal mutation noise
     'max_generations': 100,
     'checkpoint_interval': 5,
     'max_steps': 5000,
@@ -504,12 +534,14 @@ FAST_CONFIG = {
 STABLE_CONFIG = {
     'game': 'mspacman',
     'name': 'Stable learning profile',
-    'population_size': 100,
+    'population_size': 300,
     'network_type': 'large',       # 128 -> 128 -> 128 -> 9
     'fitness_episodes': 3,
     'mutation_std': 0.05,
-    'elite_count': 5,
+    'elite_count': 10,
     'truncation_ratio': 0.15,
+    'explorer_count': 15,           # heavy-mutated scouts per generation
+    'explorer_std_mult': 3.0,       # explorers get 3x normal mutation noise
     'max_generations': 300,
     'checkpoint_interval': 10,
     'max_steps': 10000,
@@ -526,8 +558,9 @@ def main():
 
     # Menu
     options = [
-        f"New run - {FAST_CONFIG['name']} (~30 min / 100 gen)",
-        f"New run - {STABLE_CONFIG['name']} (~2-3 hrs / 300 gen)",
+        f"New run - {QUICK_CONFIG['name']} (30 pop, ~15-20 min / 50 gen)",
+        f"New run - {FAST_CONFIG['name']} (100 pop, ~1-2 hrs / 100 gen)",
+        f"New run - {STABLE_CONFIG['name']} (300 pop, ~6-8 hrs / 300 gen)",
     ]
 
     if os.path.exists(CHECKPOINT_PATH):
@@ -537,9 +570,12 @@ def main():
 
     # Determine config and resume status
     if choice == 0:
-        config = FAST_CONFIG
+        config = QUICK_CONFIG
         resume = False
     elif choice == 1:
+        config = FAST_CONFIG
+        resume = False
+    elif choice == 2:
         config = STABLE_CONFIG
         resume = False
     else:

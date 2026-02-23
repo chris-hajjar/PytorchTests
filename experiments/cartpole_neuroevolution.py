@@ -24,7 +24,7 @@ def pick_menu(options):
             sys.stdout.write(f"\r\033[J")
             for i, opt in enumerate(options):
                 prefix = "> " if i == selected else "  "
-                sys.stdout.write(f"{prefix}{opt}\n")
+                sys.stdout.write(f"{prefix}{opt}\r\n")
             sys.stdout.write(f"\033[{len(options)}A")  # move cursor back up
             sys.stdout.flush()
             # Read keypress
