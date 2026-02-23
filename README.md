@@ -54,15 +54,19 @@ AutoROM --install-dir "$(python -c 'import ale_py.roms, os; print(os.path.dirnam
 ---
 
 ### 5. Ms. Pac-Man Neuroevolution (`mspacman_neuroevolution.py`)
-**Main idea:** Apply the same evolutionary algorithm from CartPole to a classic arcade game. Agent reads the Atari 2600's 128-byte RAM (player position, ghost states, pellet counts, etc.) and outputs one of 9 actions. Fitness = game score minus an idle penalty, so the agent must keep eating pellets rather than hiding in a corner.
+**Main idea:** Apply the same evolutionary algorithm from CartPole to a classic arcade game. Agent reads the Atari 2600's 128-byte RAM (player position, ghost states, pellet counts, etc.) and outputs one of 9 actions. Fitness = raw game score averaged over multiple episodes.
 
-**Takeaway:** Neuroevolution scales from simple control tasks to complex arcade games. Same principles (selection + mutation) work with larger observation spaces and longer episodes. An idle penalty in the fitness function prevents degenerate strategies like parking in a safe spot.
+**Takeaway:** Neuroevolution scales from simple control tasks to complex arcade games. Same principles (selection + mutation) work with larger observation spaces and longer episodes. Population diversity (explorers with high mutation noise) prevents degenerate strategies.
 
-**Two modes:**
-- Fast (30 population, 128→64→9 network): ~30 min per 100 generations
-- Stable (100 population, 128→128→128→9 network): ~2-3 hours per 100 generations
+**Training profiles:**
+- Quick test (30 pop, 128→64→9 network): ~15-20 min / 50 gen
+- Fast iteration (100 pop, 128→64→9 network): ~1-2 hrs / 100 gen
+- Stable learning (300 pop, 128→128→128→9 network): ~6-8 hrs / 300 gen
+- Overnight (300 pop, 128→128→128→9 network): runs until Ctrl+C, auto-saves best genome
 
-**Viewer:** `mspacman_viewer.py` loads a saved genome or checkpoint and renders the agent playing in real-time (no frame skipping).
+**Continue training:** You can pick a previously saved `.pt` genome and seed a new population from it — the saved brain becomes elite #1 and the rest of the population is built by mutating it at varying noise levels.
+
+**Viewer:** `mspacman_viewer.py` loads a saved `.pt` genome and renders the agent playing in real-time.
 
 ## Usage
 
