@@ -54,19 +54,38 @@ AutoROM --install-dir "$(python -c 'import ale_py.roms, os; print(os.path.dirnam
 ---
 
 ### 5. Ms. Pac-Man Neuroevolution (`mspacman_neuroevolution.py`)
-**Main idea:** Apply the same evolutionary algorithm from CartPole to a classic arcade game. Agent reads the Atari 2600's 128-byte RAM (player position, ghost states, pellet counts, etc.) and outputs one of 9 actions. Fitness = raw game score averaged over multiple episodes.
+**Main idea:** Apply the same evolutionary algorithm from CartPole to a classic arcade game. Agent reads the Atari 2600's 128-byte RAM (player position, ghost states, pellet counts, etc.) and outputs one of 9 actions.
 
-**Takeaway:** Neuroevolution scales from simple control tasks to complex arcade games. Same principles (selection + mutation) work with larger observation spaces and longer episodes. Population diversity (explorers with high mutation noise) prevents degenerate strategies.
+**Fitness shaping:** Unlike raw score optimization, fitness now rewards strategic play:
+- **Pellet collection**: +5 per pellet (dense progress signal)
+- **Ghost hunting**: +20 per ghost eaten (encourages power pellet strategy)
+- **Death penalty**: -500 per life lost (strong survival incentive)
+- **Level completion**: +200 bonus (ultimate goal)
+- **Efficiency**: -0.1 per step (prevents stalling)
 
-**Training profiles:**
-- Quick test (30 pop, 128→64→9 network): ~15-20 min / 50 gen
-- Fast iteration (100 pop, 128→64→9 network): ~1-2 hrs / 100 gen
-- Stable learning (300 pop, 128→128→128→9 network): ~6-8 hrs / 300 gen
-- Overnight (300 pop, 128→128→128→9 network): runs until Ctrl+C, auto-saves best genome
+This shapes agents to actively collect pellets and complete levels instead of just surviving.
 
-**Continue training:** You can pick a previously saved `.pt` genome and seed a new population from it — the saved brain becomes elite #1 and the rest of the population is built by mutating it at varying noise levels.
+**Takeaway:** Neuroevolution scales from simple control tasks to complex arcade games. Fitness shaping provides dense reward signals that guide evolution toward strategic gameplay. Population diversity (explorers with high mutation noise) prevents local optima.
 
-**Viewer:** `mspacman_viewer.py` loads a saved `.pt` genome and renders the agent playing in real-time.
+**Training modes** (all use real-time frame_skip=1):
+- **Mini** (30 pop, 128→64→9): ~1-2 hrs / 50 gen — Quick testing
+- **Small** (100 pop, 128→64→9): ~4-8 hrs / 100 gen — Small-scale training
+- **Stable** (300 pop, 128→128→128→9): ~24-36 hrs / 300 gen — Long stable training
+- **Real-time** (300 pop, 128→128→128→9): Runs until Ctrl+C — Production quality
+
+**Logging system:** Each training run creates an organized folder:
+```
+training_runs/run_20260223_183045_realtime/
+  ├── model.pt              # Best model (auto-saved when fitness improves)
+  ├── log.txt               # Full console output
+  ├── metrics.csv           # Generation stats (best/mean/worst/std)
+  ├── config.json           # Training config for reproducibility
+  └── checkpoints/          # Periodic checkpoints (gen_0005.pkl, etc.)
+```
+
+**Continue training:** You can load any previously saved `.pt` model and seed a new population from it — the saved brain becomes elite #1 and the rest of the population is built by mutating it at varying noise levels for diversity.
+
+**Viewer:** `mspacman_viewer.py` recursively scans the repository for ALL trained models (including those in `training_runs/` folders), displays them sorted by fitness, and lets you watch any agent play in real-time. Shows key info: fitness, generation, network type, and frame skip.
 
 ## Usage
 
