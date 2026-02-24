@@ -132,20 +132,24 @@ def load_genome_from_checkpoint(path):
     }
 
 
-def play_episode(model, device):
-    """Play one full episode with rendering. No frame skipping."""
+def play_episode(model, device, frame_skip=4, max_steps=10000):
+    """Play one full episode with rendering, matching training frame skip."""
     env = gym.make('ALE/MsPacman-v5', obs_type='ram', render_mode='human')
     observation, _ = env.reset()
     total_reward = 0
     steps = 0
 
-    while True:
+    while steps < max_steps:
         state = torch.FloatTensor(observation.astype(np.float32) / 255.0).unsqueeze(0).to(device)
         action = model.select_action(state)
 
-        observation, reward, terminated, truncated, _ = env.step(action)
-        total_reward += reward
-        steps += 1
+        # Repeat action for frame_skip frames (matching training)
+        for _ in range(frame_skip):
+            observation, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            steps += 1
+            if terminated or truncated or steps >= max_steps:
+                break
 
         if terminated or truncated:
             break
@@ -154,23 +158,49 @@ def play_episode(model, device):
     return total_reward, steps
 
 
+def find_all_models(base_dir):
+    """Recursively find all .pt model files in the repository."""
+    models = []
+
+    for root, dirs, files in os.walk(base_dir):
+        for f in sorted(files):
+            if not f.endswith('.pt'):
+                continue
+
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, base_dir)
+
+            try:
+                data = torch.load(full_path, weights_only=False)
+                if data.get('config', {}).get('game') == 'mspacman':
+                    models.append({
+                        'filename': f,
+                        'rel_path': rel_path,
+                        'full_path': full_path,
+                        'fitness': data.get('fitness', 0),
+                        'generation': data.get('generation', 0),
+                        'config_name': data.get('config', {}).get('name', 'unknown'),
+                        'network_type': data.get('config', {}).get('network_type', 'unknown'),
+                        'frame_skip': data.get('config', {}).get('frame_skip', 4),
+                    })
+            except Exception as e:
+                # Skip files that can't be loaded
+                pass
+
+    # Sort by fitness (best first)
+    models.sort(key=lambda m: m['fitness'], reverse=True)
+    return models
+
+
 def main():
     print("Ms. Pac-Man Genome Viewer\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     script_dir = os.path.dirname(__file__)
 
-    # Find available genomes (only show Ms. Pac-Man ones)
-    compatible_pt = []
-    for f in sorted(os.listdir(script_dir)):
-        if not f.endswith('.pt'):
-            continue
-        try:
-            data = torch.load(os.path.join(script_dir, f), weights_only=False)
-            if data.get('config', {}).get('game') == 'mspacman':
-                compatible_pt.append(f)
-        except Exception:
-            pass
+    # Find all models recursively
+    print("Scanning for models...")
+    models = find_all_models(script_dir)
 
     checkpoint_path = os.path.join(script_dir, 'mspacman_neuroevo_checkpoint.pkl')
     has_checkpoint = os.path.exists(checkpoint_path)
@@ -182,19 +212,58 @@ def main():
         options.append("Load best from evolution checkpoint")
         option_types.append('checkpoint')
 
-    for f in compatible_pt:
-        options.append(f"Load saved genome: {f}")
-        option_types.append(('pt', f))
+    # Group models by location
+    if models:
+        # Models in training_runs folders
+        training_runs = [m for m in models if 'training_runs' in m['rel_path']]
+        root_models = [m for m in models if 'training_runs' not in m['rel_path']]
 
-    options.append("Watch random agent (baseline)")
+        print(f"Found {len(models)} model(s):")
+        if training_runs:
+            print(f"  - {len(training_runs)} in training_runs/")
+        if root_models:
+            print(f"  - {len(root_models)} saved model(s)")
+        print()
+
+        if training_runs:
+            options.append("─── Training Run Models ───")
+            option_types.append('separator')
+            for m in training_runs:
+                # Extract run name from path
+                parts = m['rel_path'].split(os.sep)
+                if len(parts) >= 2 and parts[0] == 'training_runs':
+                    run_name = parts[1]
+                    display = f"  {run_name} | fitness: {m['fitness']:.0f} | gen: {m['generation']} | fs={m['frame_skip']}"
+                else:
+                    display = f"  {m['rel_path']} | fitness: {m['fitness']:.0f}"
+                options.append(display)
+                option_types.append(('model', m))
+
+        if root_models:
+            if training_runs:  # Add separator if we already have training runs
+                options.append("─── Saved Models ───")
+                option_types.append('separator')
+            for m in root_models:
+                display = f"  {m['filename']} | fitness: {m['fitness']:.0f} | gen: {m['generation']} | {m['network_type']} | fs={m['frame_skip']}"
+                options.append(display)
+                option_types.append(('model', m))
+
+    options.append("─── Baseline ───")
+    option_types.append('separator')
+    options.append("Watch random agent")
     option_types.append('random')
 
-    if not options:
-        print("No genomes found! Run mspacman_neuroevolution.py first.")
+    if len(options) == 3:  # Only baseline option
+        print("No trained models found! Run mspacman_neuroevolution.py first.")
         return
 
     choice = pick_menu(options)
     selected = option_types[choice]
+
+    # Skip separators
+    while selected == 'separator':
+        choice = (choice + 1) % len(options)
+        selected = option_types[choice]
 
     if selected == 'checkpoint':
         model, info = load_genome_from_checkpoint(checkpoint_path)
@@ -204,20 +273,25 @@ def main():
         print(f"  Born generation: {info['generation']}")
         print(f"  Checkpoint at generation: {info['checkpoint_generation']}")
         print(f"  Config: {info['config']['name']}")
+        config = info['config']
         use_model = True
 
-    elif isinstance(selected, tuple) and selected[0] == 'pt':
-        path = os.path.join(script_dir, selected[1])
-        model, info = load_genome_from_pt(path)
+    elif isinstance(selected, tuple) and selected[0] == 'model':
+        model_info = selected[1]
+        model, info = load_genome_from_pt(model_info['full_path'])
         model = model.to(device)
-        print(f"\nLoaded genome from {selected[1]}")
+        print(f"\nLoaded: {model_info['rel_path']}")
         print(f"  Fitness: {info['fitness']:.1f}")
         print(f"  Generation: {info['generation']}")
         print(f"  Config: {info['config']['name']}")
+        print(f"  Network: {info['config']['network_type']}")
+        print(f"  Frame skip: {info['config'].get('frame_skip', 4)}")
+        config = info['config']
         use_model = True
 
     else:
         use_model = False
+        config = {'frame_skip': 1, 'max_steps': 10000}  # Default to frame_skip=1 for random
         print("\nWatching random agent...")
 
     # Play episodes
@@ -229,18 +303,25 @@ def main():
         if user_input.lower() == 'q':
             break
 
+        frame_skip = config.get('frame_skip', 4)
+        max_steps = config.get('max_steps', 10000)
+
         if use_model:
-            score, steps = play_episode(model, device)
+            score, steps = play_episode(model, device, frame_skip, max_steps)
         else:
-            # Random agent
+            # Random agent with frame skip
             env = gym.make('ALE/MsPacman-v5', obs_type='ram', render_mode='human')
             env.reset()
             score = 0
             steps = 0
-            while True:
-                _, reward, terminated, truncated, _ = env.step(env.action_space.sample())
-                score += reward
-                steps += 1
+            while steps < max_steps:
+                action = env.action_space.sample()
+                for _ in range(frame_skip):
+                    _, reward, terminated, truncated, _ = env.step(action)
+                    score += reward
+                    steps += 1
+                    if terminated or truncated or steps >= max_steps:
+                        break
                 if terminated or truncated:
                     break
             env.close()
